@@ -1,0 +1,15 @@
+{
+  "name": "Private Lybreri",
+  "short_name": "Private Lybreri",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [
+    {
+      "src": "assets/site-logo.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
