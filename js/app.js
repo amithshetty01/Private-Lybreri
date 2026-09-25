@@ -531,14 +531,21 @@ function openMobileDrawer() {
     ];
 
     drawer.innerHTML = `
-        <div class="sidebar-brand" style="margin-bottom: 20px;">
-            <div class="brand-mark"><img src="assets/site-logo.jpg" alt="Private Lybreri Logo" class="brand-logo-img"></div>
-            <div>
-                <div class="brand-name">Private Lybreri</div>
-                <div class="brand-caption">Personal Library</div>
+        <div class="drawer-header">
+            <div class="sidebar-brand-head">
+                <div class="brand-mark">
+                    <img src="${transparentLogoDataUrl || 'assets/site-logo.png'}" alt="Private Lybreri Logo" class="brand-logo-img">
+                </div>
+                <div class="brand-name">
+                    Private<br>Lybreri
+                </div>
             </div>
+            <button class="close drawer-close-btn" id="closeDrawerBtn" title="Close Menu" aria-label="Close menu">
+                ${icon("X", 20)}
+            </button>
         </div>
-        <nav class="nav-list">
+
+        <nav class="nav-list" style="margin-top: 20px;">
             ${nav.map(([id, label, iconName]) => `
                 <button class="nav-item ${currentView === id ? "active" : ""}" data-drawer-view="${id}">
                     ${icon(iconName, 19)}
@@ -546,7 +553,14 @@ function openMobileDrawer() {
                 </button>
             `).join("")}
         </nav>
+
+        <div class="drawer-footer-quote">
+            <span class="quote-line"></span>
+            <em>“Good books build great days.”</em>
+        </div>
     `;
+
+    loadTransparentLogo();
 
     setTimeout(() => {
         backdrop.classList.add("open");
@@ -559,6 +573,7 @@ function openMobileDrawer() {
     };
 
     backdrop.onclick = close;
+    document.querySelector("#closeDrawerBtn")?.addEventListener("click", close);
     drawer.querySelectorAll("[data-drawer-view]").forEach(btn => {
         btn.onclick = () => {
             currentView = btn.dataset.drawerView;
@@ -2079,12 +2094,14 @@ function showModal(content, title = "Book Details") {
                         <h2>${title}</h2>
                     </div>
 
-                    <button class="close" id="closeModal">
+                    <button class="close" id="closeModal" aria-label="Close Modal">
                         ${icon("X", 20)}
                     </button>
                 </div>
 
-                ${content}
+                <div class="modal-body">
+                    ${content}
+                </div>
             </div>
         </div>
     `;
