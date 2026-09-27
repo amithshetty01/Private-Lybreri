@@ -240,31 +240,246 @@ function renderStars(rating = 0, size = 13) {
     return html;
 }
 
-async function fetchOpenLibraryMetadata(isbn) {
-    const cleanIsbn = isbn.replace(/[^0-9X]/gi, '');
-    if (!cleanIsbn) return null;
+function validateAndCleanIsbn(rawIsbn) {
+    if (!rawIsbn || typeof rawIsbn !== "string") return { valid: false, isbn: "", type: null };
+    const cleaned = rawIsbn.replace(/[^0-9X]/gi, '').toUpperCase();
     
+    if (cleaned.length === 10) {
+        let sum = 0;
+        for (let i = 0; i < 9; i++) {
+            if (cleaned[i] < '0' || cleaned[i] > '9') return { valid: false, isbn: cleaned, type: 'ISBN-10' };
+            sum += (10 - i) * parseInt(cleaned[i], 10);
+        }
+        let lastChar = cleaned[9];
+        if (lastChar === 'X') sum += 10;
+        else if (lastChar >= '0' && lastChar <= '9') sum += parseInt(lastChar, 10);
+        else return { valid: false, isbn: cleaned, type: 'ISBN-10' };
+
+        const isValid = (sum % 11 === 0);
+        return { valid: isValid, isbn: cleaned, type: 'ISBN-10' };
+    } else if (cleaned.length === 13) {
+        if (!cleaned.startsWith('978') && !cleaned.startsWith('979')) {
+            return { valid: false, isbn: cleaned, type: 'ISBN-13' };
+        }
+        let sum = 0;
+        for (let i = 0; i < 12; i++) {
+            let digit = parseInt(cleaned[i], 10);
+            if (isNaN(digit)) return { valid: false, isbn: cleaned, type: 'ISBN-13' };
+            sum += (i % 2 === 0) ? digit : digit * 3;
+        }
+        let checkDigit = (10 - (sum % 10)) % 10;
+        let lastDigit = parseInt(cleaned[12], 10);
+        const isValid = (checkDigit === lastDigit);
+        return { valid: isValid, isbn: cleaned, type: 'ISBN-13' };
+    }
+
+    return { valid: false, isbn: cleaned, type: null };
+}
+
+function extractYear(dateStr) {
+    if (!dateStr) return "";
+    const match = String(dateStr).match(/\b(17|18|19|20)\d{2}\b/);
+    return match ? match[0] : "";
+}
+
+function normalizeString(str) {
+    if (!str || typeof str !== "string") return "";
+    const trimmed = str.trim();
+    if (["null", "undefined", "unknown", "n/a", "none"].includes(trimmed.toLowerCase())) return "";
+    return trimmed;
+}
+
+function normalizeAuthors(authorInput) {
+    if (!authorInput) return "";
+    let str = "";
+    if (Array.isArray(authorInput)) {
+        str = authorInput.map(a => typeof a === "object" ? a.name : a).join(", ");
+    } else {
+        str = String(authorInput);
+    }
+    const parts = str.split(/[,;\n]/).map(a => a.trim().replace(/^by\s+/i, '')).filter(Boolean);
+    const unique = [...new Set(parts)];
+    return unique.join(", ");
+}
+
+function normalizeCategories(catInput) {
+    if (!catInput) return "";
+    let str = "";
+    if (Array.isArray(catInput)) {
+        str = catInput.map(c => typeof c === "object" ? c.name : c).join(", ");
+    } else {
+        str = String(catInput);
+    }
+    const parts = str.split(/[,;\/]/).map(c => c.trim()).filter(c => c && !["general", "books", "fiction", "non-fiction"].includes(c.toLowerCase()));
+    const unique = [...new Set(parts)];
+    return unique.slice(0, 4).join(", ") || (parts[0] || "");
+}
+
+function normalizeLanguageCode(code) {
+    if (!code) return "English";
+    const c = String(code).toLowerCase().trim();
+    if (c === "en" || c === "eng" || c === "english") return "English";
+    if (c === "fr" || c === "fre" || c === "fra" || c === "french") return "French";
+    if (c === "de" || c === "ger" || c === "deu" || c === "german") return "German";
+    if (c === "es" || c === "spa" || c === "spanish") return "Spanish";
+    if (c === "it" || c === "ita" || c === "italian") return "Italian";
+    if (c === "ja" || c === "jpn" || c === "japanese") return "Japanese";
+    if (c === "zh" || c === "chi" || c === "zho" || c === "chinese") return "Chinese";
+    return c.charAt(0).toUpperCase() + c.slice(1);
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const res = await fetch(`https://openlibrary.org/api/books?bibkeys=ISBN:${cleanIsbn}&format=json&jscmd=data`);
-        if (!res.ok) return null;
-        const data = await res.json();
-        const key = `ISBN:${cleanIsbn}`;
-        if (data && data[key]) {
-            const b = data[key];
-            return {
-                title: b.title || "",
-                author: b.authors ? b.authors.map(a => a.name).join(", ") : "",
-                publisher: b.publishers ? b.publishers.map(p => p.name).join(", ") : "",
-                year: b.publish_date || "",
-                pages: b.number_of_pages || 0,
-                cover: b.cover ? (b.cover.medium || b.cover.large || b.cover.small) : `https://covers.openlibrary.org/b/isbn/${cleanIsbn}-M.jpg`,
-                genre: b.subjects ? b.subjects[0]?.name || "General" : "General"
-            };
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(timer);
+        return response;
+    } catch (err) {
+        clearTimeout(timer);
+        throw err;
+    }
+}
+
+async function fetchBookMetadata(rawIsbn) {
+    const isbnInfo = validateAndCleanIsbn(rawIsbn);
+    const cleanIsbn = isbnInfo.isbn || rawIsbn.replace(/[^0-9X]/gi, '').toUpperCase();
+    if (!cleanIsbn) return null;
+
+    let olData = null;
+    let gbData = null;
+
+    // 1. Fetch Open Library Books API (Primary)
+    try {
+        const res = await fetchWithTimeout(`https://openlibrary.org/api/books?bibkeys=ISBN:${cleanIsbn}&format=json&jscmd=data`);
+        if (res.ok) {
+            const data = await res.json();
+            const key = `ISBN:${cleanIsbn}`;
+            if (data && data[key]) {
+                const b = data[key];
+                olData = {
+                    title: b.title || "",
+                    subtitle: b.subtitle || "",
+                    author: b.authors ? b.authors.map(a => a.name).join(", ") : "",
+                    publisher: b.publishers ? b.publishers.map(p => p.name).join(", ") : "",
+                    publisherLocation: b.publish_places ? b.publish_places.map(p => p.name).join(", ") : "",
+                    pubDate: b.publish_date || "",
+                    year: extractYear(b.publish_date),
+                    pages: b.number_of_pages || "",
+                    cover: b.cover ? (b.cover.large || b.cover.medium || b.cover.small) : `https://covers.openlibrary.org/b/isbn/${cleanIsbn}-L.jpg`,
+                    genre: b.subjects ? b.subjects.slice(0, 3).map(s => s.name).join(", ") : "",
+                    subjects: b.subjects ? b.subjects.map(s => s.name).join(", ") : "",
+                    edition: b.by_statement || b.edition_name || "",
+                    description: b.notes || (typeof b.description === "string" ? b.description : b.description?.value) || ""
+                };
+            }
         }
     } catch (err) {
-        console.warn("Open Library fetch error:", err);
+        console.warn("Open Library primary lookup warning:", err);
     }
-    return null;
+
+    // 2. Fetch Open Library Edition JSON for extra fields (languages, series, work key)
+    try {
+        const edRes = await fetchWithTimeout(`https://openlibrary.org/isbn/${cleanIsbn}.json`);
+        if (edRes.ok) {
+            const ed = await edRes.json();
+            if (!olData) olData = {};
+            if (!olData.title && ed.title) olData.title = ed.title;
+            if (!olData.subtitle && ed.subtitle) olData.subtitle = ed.subtitle;
+            if (!olData.publisher && ed.publishers) olData.publisher = ed.publishers.join(", ");
+            if (!olData.pubDate && ed.publish_date) olData.pubDate = ed.publish_date;
+            if (!olData.year && ed.publish_date) olData.year = extractYear(ed.publish_date);
+            if (!olData.pages && ed.number_of_pages) olData.pages = ed.number_of_pages;
+            if (!olData.edition && (ed.edition_name || ed.physical_format)) {
+                olData.edition = [ed.edition_name, ed.physical_format].filter(Boolean).join(" - ");
+            }
+            if (ed.series) {
+                olData.seriesName = Array.isArray(ed.series) ? ed.series.join(", ") : String(ed.series);
+            }
+            if (ed.languages && ed.languages.length > 0) {
+                const langKey = ed.languages[0].key || "";
+                olData.language = normalizeLanguageCode(langKey.split("/").pop());
+            }
+
+            if (!olData.description && ed.works && ed.works[0] && ed.works[0].key) {
+                try {
+                    const workRes = await fetchWithTimeout(`https://openlibrary.org${ed.works[0].key}.json`);
+                    if (workRes.ok) {
+                        const workData = await workRes.json();
+                        const desc = workData.description;
+                        if (typeof desc === "string") olData.description = desc;
+                        else if (desc && desc.value) olData.description = desc.value;
+                        if (!olData.genre && workData.subjects) {
+                            olData.genre = normalizeCategories(workData.subjects.join(", "));
+                        }
+                    }
+                } catch (e) {}
+            }
+        }
+    } catch (e) {}
+
+    // Check if Open Library has essential metadata
+    const olSufficient = olData && olData.title && olData.author && olData.publisher;
+
+    // 3. Fallback / Complementary Lookup from Google Books API
+    if (!olSufficient) {
+        try {
+            const gbRes = await fetchWithTimeout(`https://www.googleapis.com/books/v1/volumes?q=isbn:${cleanIsbn}`);
+            if (gbRes.ok) {
+                const gbJson = await gbRes.json();
+                if (gbJson.items && gbJson.items.length > 0) {
+                    const info = gbJson.items[0].volumeInfo;
+                    gbData = {
+                        title: info.title || "",
+                        subtitle: info.subtitle || "",
+                        author: info.authors ? info.authors.join(", ") : "",
+                        publisher: info.publisher || "",
+                        pubDate: info.publishedDate || "",
+                        year: extractYear(info.publishedDate),
+                        pages: info.pageCount || "",
+                        language: normalizeLanguageCode(info.language || ""),
+                        genre: info.categories ? info.categories.join(", ") : "",
+                        description: info.description || "",
+                        cover: info.imageLinks ? (info.imageLinks.extraLarge || info.imageLinks.large || info.imageLinks.medium || info.imageLinks.thumbnail || info.imageLinks.smallThumbnail)?.replace(/^http:/, 'https:') : "",
+                        edition: info.editionInfo || ""
+                    };
+                    if (info.seriesInfo) {
+                        gbData.seriesName = info.seriesInfo.seriesId || "";
+                        gbData.seriesNumber = info.seriesInfo.bookDisplayNumber || "";
+                    }
+                }
+            }
+        } catch (err) {
+            console.warn("Google Books fallback fetch warning:", err);
+        }
+    }
+
+    if (!olData && !gbData) {
+        return null;
+    }
+
+    // Merge Open Library (Primary) + Google Books (Fallback)
+    const merged = {
+        isbn: cleanIsbn,
+        title: normalizeString(olData?.title || gbData?.title),
+        subtitle: normalizeString(olData?.subtitle || gbData?.subtitle),
+        author: normalizeAuthors(olData?.author || gbData?.author),
+        publisher: normalizeString(olData?.publisher || gbData?.publisher),
+        publisherLocation: normalizeString(olData?.publisherLocation || gbData?.publisherLocation),
+        pubDate: normalizeString(olData?.pubDate || gbData?.pubDate),
+        year: olData?.year || gbData?.year || "",
+        edition: normalizeString(olData?.edition || gbData?.edition),
+        pages: olData?.pages || gbData?.pages || "",
+        language: normalizeString(olData?.language || gbData?.language || "English"),
+        genre: normalizeCategories(olData?.genre || gbData?.genre),
+        subjects: normalizeCategories(olData?.subjects || gbData?.genre),
+        description: normalizeString(olData?.description || gbData?.description),
+        cover: olData?.cover || gbData?.cover || `https://covers.openlibrary.org/b/isbn/${cleanIsbn}-L.jpg`,
+        seriesName: normalizeString(olData?.seriesName || gbData?.seriesName),
+        seriesNumber: olData?.seriesNumber || gbData?.seriesNumber || ""
+    };
+
+    return merged;
 }
 
 function exportLibraryJSON() {
@@ -1486,11 +1701,13 @@ function openBook(id) {
 
             <div>
                 <div class="eyebrow">
-                    ${book.status.replace("-", " ").toUpperCase()}
+                    ${(book.status || "unread").replace("-", " ").toUpperCase()}
                 </div>
 
                 <h1>${escapeHtml(book.title)}</h1>
-                <p>${escapeHtml(book.author)}</p>
+                ${book.subtitle ? `<p style="font-style:italic; margin-top:-4px; color:var(--muted);">${escapeHtml(book.subtitle)}</p>` : ''}
+                <p style="margin: 4px 0;"><strong>Author:</strong> ${escapeHtml(book.author || "Unknown")}</p>
+                ${book.seriesName ? `<p style="margin: 2px 0; font-size: 12px; color: var(--muted);"><small>Series:</small> ${escapeHtml(book.seriesName)} ${book.seriesNumber ? `#${escapeHtml(book.seriesNumber)}` : ''}</p>` : ''}
 
                 <div style="margin-top: 8px;">
                     <div id="modalStarRating" class="star-rating">
@@ -1512,12 +1729,22 @@ function openBook(id) {
 
             <div>
                 <small>YEAR & PAGES</small>
-                <strong>${escapeHtml(book.year || "—")} · ${book.pages ? `${book.pages} pages` : "—"}</strong>
+                <strong>${escapeHtml(book.year || book.pubDate || "—")} · ${book.pages ? `${book.pages} pages` : "—"}</strong>
+            </div>
+
+            <div>
+                <small>PUBLISHER & EDITION</small>
+                <strong>${escapeHtml(book.publisher || "—")}${book.publisherLocation ? ` (${escapeHtml(book.publisherLocation)})` : ''} ${book.edition ? `· ${escapeHtml(book.edition)}` : ''}</strong>
+            </div>
+
+            <div>
+                <small>LANGUAGE & GENRE</small>
+                <strong>${escapeHtml(book.language || "English")} · ${escapeHtml(book.genre || "General")}</strong>
             </div>
 
             <div>
                 <small>LOCATION</small>
-                <strong>${escapeHtml(formatShelf(book.shelf))}</strong>
+                <strong>${escapeHtml(formatShelf(book.shelf))} (${escapeHtml(book.room || 'Study')})</strong>
             </div>
 
             <div>
@@ -1525,6 +1752,13 @@ function openBook(id) {
                 <strong>${escapeHtml((book.condition || "very-good").replace("-", " "))} · ${escapeHtml(book.acquisition || "purchased")}</strong>
             </div>
         </div>
+
+        ${book.description ? `
+        <div style="margin: 10px 0; font-size: 12px; line-height: 1.5; color: var(--ink); background: rgba(0,0,0,0.03); padding: 10px; border-radius: 10px; max-height: 120px; overflow-y: auto;">
+            <small style="display:block; text-transform:uppercase; letter-spacing:0.1em; color:var(--muted); font-weight:600; margin-bottom:4px;">Description</small>
+            <div>${escapeHtml(book.description)}</div>
+        </div>
+        ` : ''}
 
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
             <div class="note-label">
@@ -1630,12 +1864,20 @@ function openBookForm() {
     const book = {
         id: crypto.randomUUID(),
         title: "",
+        subtitle: "",
         author: "",
         isbn: "",
         genre: "",
         publisher: "",
+        publisherLocation: "",
+        pubDate: "",
         year: "",
+        edition: "",
         pages: "",
+        language: "English",
+        seriesName: "",
+        seriesNumber: "",
+        description: "",
         cover: "",
         status: "unread",
         progress: 0,
@@ -1663,49 +1905,84 @@ function showBookForm(book) {
             <label class="full">
                 ISBN
                 <div style="display: flex; gap: 8px;">
-                    <input id="f-isbn" value="${escapeHtml(book.isbn)}" placeholder="e.g. 9780735211292">
+                    <input id="f-isbn" value="${escapeHtml(book.isbn || '')}" placeholder="e.g. 9780735211292">
                     <button type="button" class="ghost-btn" id="fetchIsbnBtn" style="white-space: nowrap;">
                         ${icon("Search", 14)} Auto-Fetch
                     </button>
                 </div>
                 <div id="fetchBadge" class="fetching-badge" style="display:none;">
-                    ${icon("Loader", 12)} Searching Open Library database...
+                    ${icon("Loader", 12)} Looking up book details...
                 </div>
             </label>
 
             <label class="full">
                 Title
-                <input id="f-title" value="${escapeHtml(book.title)}" placeholder="Book title">
+                <input id="f-title" value="${escapeHtml(book.title || '')}" placeholder="Book title">
+            </label>
+
+            <label class="full">
+                Subtitle
+                <input id="f-subtitle" value="${escapeHtml(book.subtitle || '')}" placeholder="Subtitle (optional)">
             </label>
 
             <label>
-                Author
-                <input id="f-author" value="${escapeHtml(book.author)}" placeholder="Author name">
+                Author(s)
+                <input id="f-author" value="${escapeHtml(book.author || '')}" placeholder="Author name(s)">
             </label>
 
             <label>
-                Genre
-                <input id="f-genre" value="${escapeHtml(book.genre)}" placeholder="e.g. Fiction, History">
+                Genre / Subjects
+                <input id="f-genre" value="${escapeHtml(book.genre || '')}" placeholder="e.g. Fiction, History">
             </label>
 
             <label>
                 Publisher
-                <input id="f-publisher" value="${escapeHtml(book.publisher)}">
+                <input id="f-publisher" value="${escapeHtml(book.publisher || '')}" placeholder="Publisher name">
             </label>
 
             <label>
-                Year
-                <input id="f-year" value="${escapeHtml(book.year)}" placeholder="e.g. 2021">
+                Publisher Location
+                <input id="f-publisher-location" value="${escapeHtml(book.publisherLocation || '')}" placeholder="e.g. New York">
             </label>
 
             <label>
-                Pages
-                <input id="f-pages" type="number" value="${book.pages || ""}">
+                Publication Date
+                <input id="f-pubdate" value="${escapeHtml(book.pubDate || '')}" placeholder="e.g. Oct 9, 2018">
+            </label>
+
+            <label>
+                Publication Year
+                <input id="f-year" value="${escapeHtml(book.year || '')}" placeholder="e.g. 2018">
+            </label>
+
+            <label>
+                Edition Information
+                <input id="f-edition" value="${escapeHtml(book.edition || '')}" placeholder="e.g. 1st Edition, Hardcover">
+            </label>
+
+            <label>
+                Number of Pages
+                <input id="f-pages" type="number" value="${book.pages || ''}" placeholder="e.g. 320">
+            </label>
+
+            <label>
+                Language
+                <input id="f-language" value="${escapeHtml(book.language || 'English')}" placeholder="e.g. English">
+            </label>
+
+            <label>
+                Series Name
+                <input id="f-series-name" value="${escapeHtml(book.seriesName || '')}" placeholder="e.g. Dune Saga">
+            </label>
+
+            <label>
+                Series Number
+                <input id="f-series-number" value="${escapeHtml(book.seriesNumber || '')}" placeholder="e.g. 1">
             </label>
 
             <div class="note-label">
                 Status
-                ${renderCustomSelect("f-status", book.status, [
+                ${renderCustomSelect("f-status", book.status || "unread", [
                     { value: "wishlist", label: "Wishlist (To Purchase)" },
                     { value: "unread", label: "Unread" },
                     { value: "reading", label: "Reading" },
@@ -1717,12 +1994,20 @@ function showBookForm(book) {
             <label class="full">
                 Cover Image (URL or Photo)
                 <div class="cover-upload-box">
-                    <input id="f-cover" value="${escapeHtml(book.cover)}" placeholder="Image URL or upload a photo" style="flex:1;">
+                    <div id="f-cover-preview" class="cover-preview" style="${book.cover ? '' : 'display:none;'}">
+                        <img id="f-cover-img" src="${escapeHtml(book.cover || '')}" alt="Cover preview" onerror="this.parentElement.style.display='none'">
+                    </div>
+                    <input id="f-cover" value="${escapeHtml(book.cover || '')}" placeholder="Image URL or upload a photo" style="flex:1;">
                     <label class="ghost-btn" style="cursor:pointer; white-space:nowrap;">
                         Upload Photo
                         <input id="f-cover-file" type="file" accept="image/*" style="display:none;">
                     </label>
                 </div>
+            </label>
+
+            <label class="full">
+                Description
+                <textarea id="f-description" placeholder="Book overview / summary...">${escapeHtml(book.description || '')}</textarea>
             </label>
 
             <label class="full">
@@ -1737,13 +2022,23 @@ function showBookForm(book) {
             </label>
 
             <label>
+                Room
+                <input id="f-room" value="${escapeHtml(book.room || 'Study')}" placeholder="e.g. Study">
+            </label>
+
+            <label>
+                Bookcase
+                <input id="f-bookcase" value="${escapeHtml(book.bookcase || 'Bookcase I')}" placeholder="e.g. Bookcase I">
+            </label>
+
+            <label>
                 Shelf Location
-                <input id="f-shelf" value="${escapeHtml(book.shelf || "Shelf 01")}">
+                <input id="f-shelf" value="${escapeHtml(book.shelf || 'Shelf 01')}" placeholder="e.g. Shelf 01">
             </label>
 
             <label>
                 Position / Shelf Spot
-                <input id="f-position" value="${escapeHtml(book.position || "")}">
+                <input id="f-position" value="${escapeHtml(book.position || '')}" placeholder="e.g. 14">
             </label>
 
             <div class="note-label">
@@ -1768,9 +2063,14 @@ function showBookForm(book) {
                 ])}
             </div>
 
+            <label>
+                Date Acquired
+                <input id="f-acquired-at" type="date" value="${escapeHtml(book.acquiredAt || new Date().toISOString().slice(0, 10))}">
+            </label>
+
             <label class="full">
-                Notes
-                <textarea id="f-notes" placeholder="Personal notes, quotes, or thoughts...">${escapeHtml(book.notes)}</textarea>
+                Personal Notes & Thoughts
+                <textarea id="f-notes" placeholder="Personal notes, quotes, or thoughts...">${escapeHtml(book.notes || '')}</textarea>
             </label>
         </div>
 
@@ -1791,6 +2091,25 @@ function showBookForm(book) {
             </button>
         </div>
     `, book.status === "wishlist" ? (book.title ? "Edit Wishlist Item" : "Add to Wishlist") : (book.title ? "Edit Book" : "Add a Book"));
+
+    bindCustomSelects();
+
+    const coverInput = document.querySelector("#f-cover");
+    const coverPreview = document.querySelector("#f-cover-preview");
+    const coverImg = document.querySelector("#f-cover-img");
+
+    const updateCoverPreview = (url) => {
+        if (url && coverPreview && coverImg) {
+            coverImg.src = url;
+            coverPreview.style.display = "grid";
+        } else if (coverPreview) {
+            coverPreview.style.display = "none";
+        }
+    };
+
+    coverInput?.addEventListener("input", (e) => {
+        updateCoverPreview(e.target.value.trim());
+    });
 
     document.querySelectorAll("#formStarRating button").forEach(btn => {
         btn.addEventListener("click", () => {
@@ -1813,7 +2132,9 @@ function showBookForm(book) {
         if (e.target.files && e.target.files[0]) {
             const reader = new FileReader();
             reader.onload = (evt) => {
-                document.querySelector("#f-cover").value = evt.target.result;
+                const dataUrl = evt.target.result;
+                if (coverInput) coverInput.value = dataUrl;
+                updateCoverPreview(dataUrl);
                 showToast("Photo attached!");
             };
             reader.readAsDataURL(e.target.files[0]);
@@ -1826,24 +2147,46 @@ function showBookForm(book) {
             showToast("Please enter an ISBN first.", "info");
             return;
         }
+
         const badge = document.querySelector("#fetchBadge");
         if (badge) badge.style.display = "inline-flex";
 
-        const meta = await fetchOpenLibraryMetadata(isbnVal);
+        showToast("Looking up book details...");
+        const meta = await fetchBookMetadata(isbnVal);
         if (badge) badge.style.display = "none";
 
         if (meta) {
-            if (meta.title && !document.querySelector("#f-title").value) document.querySelector("#f-title").value = meta.title;
-            if (meta.author && !document.querySelector("#f-author").value) document.querySelector("#f-author").value = meta.author;
-            if (meta.publisher && !document.querySelector("#f-publisher").value) document.querySelector("#f-publisher").value = meta.publisher;
-            if (meta.year && !document.querySelector("#f-year").value) document.querySelector("#f-year").value = meta.year;
-            if (meta.pages && !document.querySelector("#f-pages").value) document.querySelector("#f-pages").value = meta.pages;
-            if (meta.genre && !document.querySelector("#f-genre").value) document.querySelector("#f-genre").value = meta.genre;
-            if (meta.cover && !document.querySelector("#f-cover").value) document.querySelector("#f-cover").value = meta.cover;
+            const setIfPresent = (id, val) => {
+                const el = document.querySelector(id);
+                if (el && val) el.value = val;
+            };
 
-            showToast("Found book metadata from Open Library!");
+            setIfPresent("#f-title", meta.title);
+            setIfPresent("#f-subtitle", meta.subtitle);
+            setIfPresent("#f-author", meta.author);
+            setIfPresent("#f-genre", meta.genre);
+            setIfPresent("#f-publisher", meta.publisher);
+            setIfPresent("#f-publisher-location", meta.publisherLocation);
+            setIfPresent("#f-pubdate", meta.pubDate);
+            setIfPresent("#f-year", meta.year);
+            setIfPresent("#f-edition", meta.edition);
+            setIfPresent("#f-pages", meta.pages);
+            setIfPresent("#f-language", meta.language);
+            setIfPresent("#f-series-name", meta.seriesName);
+            setIfPresent("#f-series-number", meta.seriesNumber);
+            setIfPresent("#f-description", meta.description);
+
+            if (meta.cover) {
+                const coverEl = document.querySelector("#f-cover");
+                if (coverEl) {
+                    coverEl.value = meta.cover;
+                    updateCoverPreview(meta.cover);
+                }
+            }
+
+            showToast(meta.title ? "Book details found" : "Some details could not be found — please complete the remaining fields.");
         } else {
-            showToast("No metadata found for this ISBN. Enter details manually.", "info");
+            showToast("Some details could not be found — please complete the remaining fields.", "info");
         }
     };
 
@@ -1857,36 +2200,48 @@ function showBookForm(book) {
 
     document.querySelector("#saveForm").addEventListener("click", async () => {
         const title = document.querySelector("#f-title").value.trim();
+        const isbnVal = document.querySelector("#f-isbn").value.trim();
 
-        if (!title) {
-            showToast("Please enter a book title.", "error");
+        if (!title && !isbnVal) {
+            showToast("Please enter at least a book title or ISBN.", "error");
             return;
         }
 
-        const selectedStatus = document.querySelector("#f-status")?.dataset.value || book.status;
-        const selectedCondition = document.querySelector("#f-condition")?.dataset.value || book.condition;
-        const selectedAcquisition = document.querySelector("#f-acquisition")?.dataset.value || book.acquisition;
+        const finalTitle = title || `Book (${isbnVal})`;
+        const selectedStatus = document.querySelector("#f-status")?.dataset.value || book.status || "unread";
+        const selectedCondition = document.querySelector("#f-condition")?.dataset.value || book.condition || "very-good";
+        const selectedAcquisition = document.querySelector("#f-acquisition")?.dataset.value || book.acquisition || "purchased";
         const totalPages = Number(document.querySelector("#f-pages").value) || 0;
 
         const updatedBook = {
             id: book.id || crypto.randomUUID(),
-            title,
+            title: finalTitle,
+            subtitle: document.querySelector("#f-subtitle").value.trim(),
             author: document.querySelector("#f-author").value.trim(),
-            isbn: document.querySelector("#f-isbn").value.trim(),
+            isbn: isbnVal,
             genre: document.querySelector("#f-genre").value.trim(),
             publisher: document.querySelector("#f-publisher").value.trim(),
+            publisherLocation: document.querySelector("#f-publisher-location").value.trim(),
+            pubDate: document.querySelector("#f-pubdate").value.trim(),
             year: document.querySelector("#f-year").value.trim(),
+            edition: document.querySelector("#f-edition").value.trim(),
             pages: totalPages,
+            language: document.querySelector("#f-language").value.trim() || "English",
+            seriesName: document.querySelector("#f-series-name").value.trim(),
+            seriesNumber: document.querySelector("#f-series-number").value.trim(),
+            description: document.querySelector("#f-description").value.trim(),
             cover: document.querySelector("#f-cover").value.trim(),
             status: selectedStatus,
             pagesRead: book.pagesRead !== undefined ? book.pagesRead : (selectedStatus === "completed" ? totalPages : 0),
             progress: book.progress || (selectedStatus === "completed" ? 100 : 0),
             rating: formRating,
+            room: document.querySelector("#f-room").value.trim() || "Study",
+            bookcase: document.querySelector("#f-bookcase").value.trim() || "Bookcase I",
             shelf: document.querySelector("#f-shelf").value.trim() || "Shelf 01",
             position: document.querySelector("#f-position").value.trim(),
             condition: selectedCondition,
             acquisition: selectedAcquisition,
-            acquiredAt: book.acquiredAt || new Date().toISOString().slice(0, 10),
+            acquiredAt: document.querySelector("#f-acquired-at").value || book.acquiredAt || new Date().toISOString().slice(0, 10),
             startedAt: book.startedAt || "",
             finishedAt: book.finishedAt || "",
             notes: document.querySelector("#f-notes").value
@@ -2036,26 +2391,37 @@ function openScanner() {
 
     const handleLookup = async () => {
         stopCamera();
-        const isbn = document.querySelector("#scannerIsbn")?.value.trim() || "";
+        const rawIsbn = document.querySelector("#scannerIsbn")?.value.trim() || "";
 
-        if (!isbn) {
-            showToast("Please enter an ISBN.", "info");
+        if (!rawIsbn) {
+            showToast("Please enter or scan an ISBN.", "info");
             return;
         }
 
-        showToast("Fetching details from Open Library...");
-        const meta = await fetchOpenLibraryMetadata(isbn);
+        const isbnValInfo = validateAndCleanIsbn(rawIsbn);
+        const cleanedIsbn = isbnValInfo.isbn || rawIsbn.replace(/[^0-9X]/gi, '').toUpperCase();
+
+        showToast("Looking up book details...");
+        const meta = await fetchBookMetadata(rawIsbn);
         closeModal();
 
         const newBook = {
             id: crypto.randomUUID(),
             title: meta?.title || "",
+            subtitle: meta?.subtitle || "",
             author: meta?.author || "",
-            isbn: isbn,
+            isbn: cleanedIsbn,
             genre: meta?.genre || "",
             publisher: meta?.publisher || "",
+            publisherLocation: meta?.publisherLocation || "",
+            pubDate: meta?.pubDate || "",
             year: meta?.year || "",
+            edition: meta?.edition || "",
             pages: meta?.pages || "",
+            language: meta?.language || "English",
+            seriesName: meta?.seriesName || "",
+            seriesNumber: meta?.seriesNumber || "",
+            description: meta?.description || "",
             cover: meta?.cover || "",
             status: "unread",
             progress: 0,
@@ -2073,8 +2439,11 @@ function openScanner() {
         };
 
         showBookForm(newBook);
-        if (meta) {
-            showToast(`Loaded metadata for "${meta.title}"!`);
+
+        if (meta && (meta.title || meta.author)) {
+            showToast("Book details found");
+        } else {
+            showToast("Some details could not be found — please complete the remaining fields.", "info");
         }
     };
 
